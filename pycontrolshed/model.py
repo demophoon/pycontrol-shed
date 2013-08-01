@@ -8,12 +8,14 @@ from pycontrol import pycontrol
 import logging
 import pycontrolshed
 import socket
+import re
 
 # In [1]: route_domains = bigip.Networking.RouteDomain.get_list()
 # In [2]: route_domains
 # Out[2]: [2220L]
 
 log = logging.getLogger('pycontrolshed.model')
+
 
 def partitioned(f):
     @wraps(f)
@@ -51,8 +53,10 @@ class NodeAssistant(object):
             targets.append(self.bigip.host_to_node(node))
             states.append(target_state)
 
-        self.bigip.LocalLB.NodeAddress.set_session_enabled_state(node_addresses=targets,
-                                                                 states=states)
+        self.bigip.LocalLB.NodeAddress.set_session_enabled_state(
+            node_addresses=targets,
+            states=states,
+        )
         return self.status(nodes)
 
     @partitioned
@@ -90,6 +94,103 @@ class VirtualAssistant(object):
     @partitioned
     def all_address_statistics(self, partition=None):
         return self.bigip.LocalLB.VirtualAddress.get_all_statistics()
+
+    def getVirtualServer(self, ipaddress, port):
+        """given a BIGIP connection, an ip address and a port, returns the virtual
+        server name from the LTM"""
+        #stat = LTM.LocalLB.VirtualServer.get_all_statistics()
+        d = {}
+        serverlist = self.bigip.LocalLB.VirtualServer.get_list()
+        iplist = self.bigip.LocalLB.VirtualServer.get_destination(serverlist)
+
+        for s in serverlist:
+            address = str(iplist[serverlist.index(s)].address).split("%")[0]
+            port = str(iplist[serverlist.index(s)].port)
+            d[(address, port)] = s
+
+        return d.get((ipaddress, port))
+
+    def getRulePools(self, server):
+        """returns a list of pool names from a virtual server that only has an
+        iRule"""
+        rules = self.bigip.LocalLB.VirtualServer.get_rule([server])
+
+        rulelist = []
+
+        # get a list of rule names
+        for rule in rules:
+            for j in rule:
+                rulelist.append(str(j.rule_name))
+
+        # get a list of rule definitions objects
+        ruledefs = self.bigip.LocalLB.Rule.query_rule(rulelist)
+
+        deflist = []
+
+        # extract the actual definitions
+        for defin in ruledefs:
+            deflist.append(defin.rule_definition)
+
+        poollist = []
+
+        pool_regex = re.compile('(?:(?:\[http_uri\] [\w]+ )"([\w/]+)".*[\n\r]+.*pool ([\w-]+)|pool ([\w-]+))')
+        for defn in deflist:
+            for pool in re.findall(pool_regex, defn):
+                poollist.append(pool)
+
+        return poollist
+
+    def getPoolIPs(self, poollist, vip, port):
+        iplist = []
+        if isinstance(poollist[0], tuple):
+            self.getIPTuples(poollist, vip, port, iplist)
+        else:
+            temp = []
+            lop = self.getListofPoolIPs(poollist)
+            for ip in lop:
+                temp.append(ip)
+                iplist.append({'uri': None,
+                               'vip': vip,
+                               'port': port,
+                               'pool_name': poollist[0],
+                               'pool_ips': temp})
+        return iplist
+
+    def getIPTuples(self, poollist, vip, port, iplist):
+        for tup in poollist:
+            if tup[1] == '':
+                iplist.append({'uri': None,
+                               'vip': vip,
+                               'port': port,
+                               'pool_name': tup[2],
+                               'pool_ips': self.getListofPoolIPs([tup[2]])})
+            else:
+                iplist.append({'uri': tup[0],
+                               'vip': vip,
+                               'port': port,
+                               'pool_name': tup[1],
+                               'pool_ips': self.getListofPoolIPs([tup[1]])})
+
+    def getListofPoolIPs(self, poolname):
+        """takes a list of pool names and returns the ips in that pool"""
+        lop = self.bigip.LocalLB.Pool.get_member(poolname)
+        l = []
+        for i in lop:
+            for j in i:
+                l.append(str(j.address))
+        return l
+
+    @partitioned
+    def servers_from_ip_port(self, ipaddress, port, partition=None):
+        vs = self.getVirtualServer(ipaddress, port)
+        if not vs:
+            return []
+        defaultpools = self.bigip.LocalLB.VirtualServer.get_default_pool_name([vs])
+        if not defaultpools:
+            self.getRulePools(vs)
+        if not defaultpools:
+            return []
+        return self.getPoolIPs(defaultpools, ipaddress, port)
 
 
 class PoolAssistant(object):
@@ -343,7 +444,7 @@ class Environment(object):
     def connect_to_bigip(self, host, wsdls=None, force_reconnect=False):
         if not(wsdls):
             wsdls = self.wsdls
-        
+
         if not hasattr(self, 'password'):
             log.debug('No password has been set, attempting to retrive via keychain capabilities')
             password = pycontrolshed.get_password(self.name, self.username)
